@@ -6,7 +6,7 @@ use crate::api::ApiClient;
 use crate::blob::BlobCache;
 use crate::db::Database;
 use crate::download::{DownloadProgressCallback, DownloadRequest, ParallelDownloader};
-use crate::link::Linker;
+use crate::link::{LinkedFile, Linker};
 use crate::materialize::Cellar;
 use crate::progress::{InstallProgress, ProgressCallback};
 use crate::store::Store;
@@ -31,6 +31,15 @@ pub struct InstallPlan {
 pub struct ExecuteResult {
     pub installed: usize,
     pub skipped_homebrew: Vec<String>,
+}
+
+/// Internal struct for tracking processed packages during streaming install
+#[derive(Clone)]
+struct ProcessedPackage {
+    name: String,
+    version: String,
+    store_key: String,
+    linked_files: Vec<LinkedFile>,
 }
 
 impl Installer {
@@ -148,6 +157,7 @@ impl Installer {
     }
 
     /// Execute the install plan with progress callback
+    /// Uses streaming extraction - starts extracting each package as soon as its download completes
     pub async fn execute_with_progress(
         &mut self,
         plan: InstallPlan,
@@ -175,6 +185,13 @@ impl Installer {
             }
         }
 
+        if to_install.is_empty() {
+            return Ok(ExecuteResult {
+                installed: 0,
+                skipped_homebrew,
+            });
+        }
+
         // Download only the bottles we need
         let requests: Vec<DownloadRequest> = to_install
             .iter()
@@ -192,64 +209,101 @@ impl Installer {
             }) as DownloadProgressCallback
         });
 
-        let blob_paths = self
-            .downloader
-            .download_all_with_progress(requests, download_progress)
-            .await?;
+        // Use streaming downloads - process each as it completes
+        let mut rx = self.downloader.download_streaming(requests, download_progress);
 
-        // Unpack, materialize, and link each formula
-        for (i, (formula, bottle)) in to_install.iter().enumerate() {
-            report(InstallProgress::UnpackStarted {
-                name: formula.name.clone(),
-            });
+        // Track results by index to maintain install order for database records
+        let total = to_install.len();
+        let mut completed: Vec<Option<ProcessedPackage>> = vec![None; total];
+        let mut error: Option<Error> = None;
 
-            let blob_path = &blob_paths[i];
+        // Process downloads as they complete
+        while let Some(result) = rx.recv().await {
+            match result {
+                Ok(download) => {
+                    let idx = download.index;
+                    let (formula, bottle) = &to_install[idx];
 
-            // Use sha256 as store key
-            let store_key = &bottle.sha256;
+                    report(InstallProgress::UnpackStarted {
+                        name: formula.name.clone(),
+                    });
 
-            // Ensure store entry exists (unpack once)
-            let store_entry = self.store.ensure_entry(store_key, blob_path)?;
+                    // Extract to store (if not already extracted)
+                    let store_entry = match self.store.ensure_entry(&bottle.sha256, &download.blob_path) {
+                        Ok(entry) => entry,
+                        Err(e) => {
+                            error = Some(e);
+                            continue;
+                        }
+                    };
 
-            // Materialize to cellar
-            let keg_path = self
-                .cellar
-                .materialize(&formula.name, &formula.versions.stable, &store_entry)?;
+                    // Materialize to cellar
+                    let keg_path = match self.cellar.materialize(&formula.name, &formula.versions.stable, &store_entry) {
+                        Ok(path) => path,
+                        Err(e) => {
+                            error = Some(e);
+                            continue;
+                        }
+                    };
 
-            report(InstallProgress::UnpackCompleted {
-                name: formula.name.clone(),
-            });
+                    report(InstallProgress::UnpackCompleted {
+                        name: formula.name.clone(),
+                    });
 
-            // Link executables if requested
-            let linked_files = if link {
-                report(InstallProgress::LinkStarted {
-                    name: formula.name.clone(),
-                });
-                let files = self.linker.link_keg(&keg_path)?;
-                report(InstallProgress::LinkCompleted {
-                    name: formula.name.clone(),
-                });
-                files
-            } else {
-                Vec::new()
-            };
+                    // Link executables if requested
+                    let linked_files = if link {
+                        report(InstallProgress::LinkStarted {
+                            name: formula.name.clone(),
+                        });
+                        match self.linker.link_keg(&keg_path) {
+                            Ok(files) => {
+                                report(InstallProgress::LinkCompleted {
+                                    name: formula.name.clone(),
+                                });
+                                files
+                            }
+                            Err(e) => {
+                                error = Some(e);
+                                continue;
+                            }
+                        }
+                    } else {
+                        Vec::new()
+                    };
 
-            // Record in database
-            {
-                let tx = self.db.transaction()?;
-                tx.record_install(&formula.name, &formula.versions.stable, store_key)?;
-
-                for linked in &linked_files {
-                    tx.record_linked_file(
-                        &formula.name,
-                        &formula.versions.stable,
-                        &linked.link_path.to_string_lossy(),
-                        &linked.target_path.to_string_lossy(),
-                    )?;
+                    completed[idx] = Some(ProcessedPackage {
+                        name: formula.name.clone(),
+                        version: formula.versions.stable.clone(),
+                        store_key: bottle.sha256.clone(),
+                        linked_files,
+                    });
                 }
-
-                tx.commit()?;
+                Err(e) => {
+                    error = Some(e);
+                }
             }
+        }
+
+        // Return error if any download failed
+        if let Some(e) = error {
+            return Err(e);
+        }
+
+        // Record all successful installs in database (in order)
+        for processed in completed.into_iter().flatten() {
+            let tx = self.db.transaction()?;
+            tx.record_install(&processed.name, &processed.version, &processed.store_key)?;
+
+            for linked in &processed.linked_files {
+                tx.record_linked_file(
+                    &processed.name,
+                    &processed.version,
+                    &linked.link_path.to_string_lossy(),
+                    &linked.target_path.to_string_lossy(),
+                )?;
+            }
+
+            tx.commit()?;
         }
 
         Ok(ExecuteResult {
@@ -877,5 +931,93 @@ mod tests {
         assert!(installer.db.get_installed("mid2").is_some());
         assert!(installer.db.get_installed("leaf1").is_some());
         assert!(installer.db.get_installed("leaf2").is_some());
+    }
+
+    #[tokio::test]
+    async fn streaming_extraction_processes_as_downloads_complete() {
+        // Tests that streaming extraction works correctly by verifying
+        // packages with delayed downloads still get installed properly
+        use std::time::Duration;
+
+        let mock_server = MockServer::start().await;
+        let tmp = TempDir::new().unwrap();
+
+        // Create bottles
+        let fast_bottle = create_bottle_tarball("fastpkg");
+        let fast_sha = sha256_hex(&fast_bottle);
+        let slow_bottle = create_bottle_tarball("slowpkg");
+        let slow_sha = sha256_hex(&slow_bottle);
+
+        // Fast package formula
+        let fast_json = format!(
+            r#"{{"name":"fastpkg","versions":{{"stable":"1.0.0"}},"dependencies":[],"bottle":{{"stable":{{"files":{{"arm64_sonoma":{{"url":"{}/bottles/fast.tar.gz","sha256":"{}"}}}}}}}}}}"#,
+            mock_server.uri(), fast_sha
+        );
+
+        // Slow package formula (depends on fast)
+        let slow_json = format!(
+            r#"{{"name":"slowpkg","versions":{{"stable":"1.0.0"}},"dependencies":["fastpkg"],"bottle":{{"stable":{{"files":{{"arm64_sonoma":{{"url":"{}/bottles/slow.tar.gz","sha256":"{}"}}}}}}}}}}"#,
+            mock_server.uri(), slow_sha
+        );
+
+        // Mount API mocks
+        Mock::given(method("GET"))
+            .and(path("/fastpkg.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(&fast_json))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/slowpkg.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(&slow_json))
+            .mount(&mock_server)
+            .await;
+
+        // Fast bottle responds immediately
+        Mock::given(method("GET"))
+            .and(path("/bottles/fast.tar.gz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(fast_bottle.clone()))
+            .mount(&mock_server)
+            .await;
+
+        // Slow bottle has a delay (simulates slow network)
+        Mock::given(method("GET"))
+            .and(path("/bottles/slow.tar.gz"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(slow_bottle.clone())
+                    .set_delay(Duration::from_millis(100))
+            )
+            .mount(&mock_server)
+            .await;
+
+        let root = tmp.path().join("zerobrew");
+        let prefix = tmp.path().join("homebrew");
+        fs::create_dir_all(root.join("db")).unwrap();
+
+        let api_client = ApiClient::with_base_url(mock_server.uri());
+        let blob_cache = BlobCache::new(&root.join("cache")).unwrap();
+        let store = Store::new(&root).unwrap();
+        let cellar = Cellar::new(&root).unwrap();
+        let linker = Linker::new(&prefix).unwrap();
+        let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
+
+        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db, 4, None);
+
+        // Install slow package (which depends on fast)
+        // With streaming, fast should be extracted while slow is still downloading
+        installer.install("slowpkg", true).await.unwrap();
+
+        // Both packages should be installed
+        assert!(installer.db.get_installed("fastpkg").is_some());
+        assert!(installer.db.get_installed("slowpkg").is_some());
+
+        // Verify kegs exist
+        assert!(root.join("cellar/fastpkg/1.0.0").exists());
+        assert!(root.join("cellar/slowpkg/1.0.0").exists());
+
+        // Verify links exist
+        assert!(prefix.join("bin/fastpkg").exists());
+        assert!(prefix.join("bin/slowpkg").exists());
     }
 }

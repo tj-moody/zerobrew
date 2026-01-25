@@ -13,9 +13,16 @@ impl ApiClient {
     }
 
     pub fn with_base_url(base_url: String) -> Self {
+        // Use HTTP/2 with connection pooling for better multiplexing of parallel requests
+        let client = reqwest::Client::builder()
+            .user_agent("zerobrew/0.1")
+            .pool_max_idle_per_host(20)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+
         Self {
             base_url,
-            client: reqwest::Client::new(),
+            client,
             cache: None,
         }
     }

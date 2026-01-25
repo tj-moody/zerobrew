@@ -36,8 +36,14 @@ zerobrew improvements todo
       - avg cold speedup: 1.3x
       - avg warm speedup: 17.1x
 
+[x] 7. streaming extraction & connection optimizations
+      - streaming extraction: process each package as download completes
+      - HTTP/2 connection pooling for API client (pool_max_idle_per_host: 20)
+      - HTTP/2 connection pooling for download client (pool_max_idle_per_host: 10)
+      - auth token caching with 4-minute TTL (GHCR tokens)
+      - test: streaming_extraction_processes_as_downloads_complete
+
 remaining optimization ideas:
-- streaming extraction (extract while downloading)
-- HTTP/2 connection pooling for API calls
 - lazy signing (sign on first exec, not install)
 - prefetch dependency metadata during downloads
+- alternative bottle sources / CDN mirrors

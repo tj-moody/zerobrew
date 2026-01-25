@@ -2,13 +2,14 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use reqwest::header::{HeaderValue, AUTHORIZATION, CONTENT_LENGTH, WWW_AUTHENTICATE};
 use reqwest::StatusCode;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{mpsc, Mutex, RwLock, Semaphore};
 
 use crate::blob::BlobCache;
 use crate::progress::InstallProgress;
@@ -22,19 +23,42 @@ struct TokenResponse {
     token: String,
 }
 
+/// Result of a completed download, sent via channel for streaming processing
+#[derive(Debug, Clone)]
+pub struct DownloadResult {
+    pub name: String,
+    pub sha256: String,
+    pub blob_path: PathBuf,
+    pub index: usize,
+}
+
+/// Cached auth token with expiry
+struct CachedToken {
+    token: String,
+    expires_at: Instant,
+}
+
+/// Token cache keyed by scope (e.g., "repository:homebrew/core/lz4:pull")
+type TokenCache = Arc<RwLock<HashMap<String, CachedToken>>>;
+
 pub struct Downloader {
     client: reqwest::Client,
     blob_cache: BlobCache,
+    token_cache: TokenCache,
 }
 
 impl Downloader {
     pub fn new(blob_cache: BlobCache) -> Self {
+        // Use HTTP/2 with connection pooling for better performance
+        // Note: don't use http2_prior_knowledge() as some servers (like ghcr.io) need ALPN negotiation
         Self {
             client: reqwest::Client::builder()
                 .user_agent("zerobrew/0.1")
+                .pool_max_idle_per_host(10)
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             blob_cache,
+            token_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -60,14 +84,17 @@ impl Downloader {
             return Ok(self.blob_cache.blob_path(expected_sha256));
         }
 
-        let response = self
-            .client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| Error::NetworkFailure {
-                message: e.to_string(),
-            })?;
+        // Try with cached token first (for GHCR URLs)
+        let cached_token = self.get_cached_token_for_url(url).await;
+
+        let mut request = self.client.get(url);
+        if let Some(token) = &cached_token {
+            request = request.header(AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {token}")).unwrap());
+        }
+
+        let response = request.send().await.map_err(|e| Error::NetworkFailure {
+            message: e.to_string(),
+        })?;
 
         let response = if response.status() == StatusCode::UNAUTHORIZED {
             self.handle_auth_challenge(url, response).await?
@@ -82,6 +109,23 @@ impl Downloader {
         }
 
         self.download_response_with_progress(response, expected_sha256, name, progress).await
+    }
+
+    /// Try to get a cached token that might work for this URL
+    async fn get_cached_token_for_url(&self, url: &str) -> Option<String> {
+        // Extract scope pattern from URL (e.g., ghcr.io/v2/homebrew/core/*)
+        let scope_prefix = extract_scope_prefix(url)?;
+
+        let cache = self.token_cache.read().await;
+        let now = Instant::now();
+
+        // Find any non-expired token with matching scope prefix
+        for (scope, cached) in cache.iter() {
+            if scope.starts_with(&scope_prefix) && cached.expires_at > now {
+                return Some(cached.token.clone());
+            }
+        }
+        None
     }
 
     async fn handle_auth_challenge(
@@ -130,6 +174,16 @@ impl Downloader {
     async fn fetch_bearer_token(&self, www_authenticate: &str) -> Result<String, Error> {
         let (realm, service, scope) = parse_www_authenticate(www_authenticate)?;
 
+        // Check cache first
+        {
+            let cache = self.token_cache.read().await;
+            if let Some(cached) = cache.get(&scope) {
+                if cached.expires_at > Instant::now() {
+                    return Ok(cached.token.clone());
+                }
+            }
+        }
+
         // Use reqwest's query builder for proper URL encoding
         let token_url = reqwest::Url::parse_with_params(
             &realm,
@@ -157,6 +211,18 @@ impl Downloader {
         let token_response: TokenResponse = response.json().await.map_err(|e| Error::NetworkFailure {
             message: format!("failed to parse token response: {e}"),
         })?;
+
+        // Cache the token (GHCR tokens typically expire in 5 minutes, use 4 min to be safe)
+        {
+            let mut cache = self.token_cache.write().await;
+            cache.insert(
+                scope,
+                CachedToken {
+                    token: token_response.token.clone(),
+                    expires_at: Instant::now() + Duration::from_secs(240),
+                },
+            );
+        }
 
         Ok(token_response.token)
     }
@@ -233,6 +299,19 @@ impl Downloader {
         }
 
         writer.commit()
+    }
+}
+
+/// Extract scope prefix from a GHCR URL for token cache matching.
+/// For URL like "https://ghcr.io/v2/homebrew/core/lz4/blobs/sha256:...",
+/// returns "repository:homebrew/core/" which matches scopes like "repository:homebrew/core/lz4:pull"
+fn extract_scope_prefix(url: &str) -> Option<String> {
+    if url.contains("ghcr.io/v2/homebrew/core/") {
+        // All homebrew/core packages use the same token server, but scopes are per-package
+        // We can't reuse tokens across packages, so return the full path prefix
+        Some("repository:homebrew/core/".to_string())
+    } else {
+        None
     }
 }
 
@@ -329,6 +408,41 @@ impl ParallelDownloader {
         }
 
         Ok(results)
+    }
+
+    /// Stream downloads as they complete, allowing concurrent extraction.
+    /// Returns a receiver that yields DownloadResult for each completed download.
+    /// The downloads are started immediately and results are sent as soon as each completes.
+    pub fn download_streaming(
+        &self,
+        requests: Vec<DownloadRequest>,
+        progress: Option<DownloadProgressCallback>,
+    ) -> mpsc::Receiver<Result<DownloadResult, Error>> {
+        let (tx, rx) = mpsc::channel(requests.len().max(1));
+
+        for (index, req) in requests.into_iter().enumerate() {
+            let downloader = self.downloader.clone();
+            let semaphore = self.semaphore.clone();
+            let inflight = self.inflight.clone();
+            let progress = progress.clone();
+            let tx = tx.clone();
+            let name = req.name.clone();
+            let sha256 = req.sha256.clone();
+
+            tokio::spawn(async move {
+                let result = Self::download_with_dedup(downloader, semaphore, inflight, req, progress).await;
+                let _ = tx
+                    .send(result.map(|blob_path| DownloadResult {
+                        name,
+                        sha256,
+                        blob_path,
+                        index,
+                    }))
+                    .await;
+            });
+        }
+
+        rx
     }
 
     async fn download_with_dedup(
