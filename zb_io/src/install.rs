@@ -231,14 +231,27 @@ impl Installer {
                     });
 
                     // Extract to store (if not already extracted)
-                    let store_entry =
-                        match self.store.ensure_entry(&bottle.sha256, &download.blob_path) {
-                            Ok(entry) => entry,
-                            Err(e) => {
-                                error = Some(e);
-                                continue;
-                            }
-                        };
+                    let store_entry = match self
+                        .store
+                        .ensure_entry(&bottle.sha256, &download.blob_path)
+                    {
+                        Ok(entry) => entry,
+                        Err(Error::StoreCorruption { message }) => {
+                            // If extraction failed due to corruption, remove the corrupted blob
+                            // from cache so a retry will re-download it
+                            self.downloader.remove_blob(&bottle.sha256);
+                            error = Some(Error::StoreCorruption {
+                                message: format!(
+                                    "{message}\n\nThe corrupted download has been removed from cache. Please retry the install."
+                                ),
+                            });
+                            continue;
+                        }
+                        Err(e) => {
+                            error = Some(e);
+                            continue;
+                        }
+                    };
 
                     // Materialize to cellar
                     let keg_path = match self.cellar.materialize(

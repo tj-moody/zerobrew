@@ -97,6 +97,11 @@ impl Downloader {
         }
     }
 
+    /// Remove a blob from the cache (used when extraction fails due to corruption)
+    pub fn remove_blob(&self, sha256: &str) -> bool {
+        self.blob_cache.remove_blob(sha256).unwrap_or(false)
+    }
+
     pub async fn download(&self, url: &str, expected_sha256: &str) -> Result<PathBuf, Error> {
         self.download_with_progress(url, expected_sha256, None, None)
             .await
@@ -549,6 +554,11 @@ impl ParallelDownloader {
             semaphore: Arc::new(Semaphore::new(concurrency)),
             inflight: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Remove a blob from the cache (used when extraction fails due to corruption)
+    pub fn remove_blob(&self, sha256: &str) -> bool {
+        self.downloader.remove_blob(sha256)
     }
 
     pub async fn download_all(

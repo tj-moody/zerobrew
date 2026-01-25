@@ -426,11 +426,7 @@ mod tests {
 
         // Create existing Homebrew symlink (as if `brew link neovim` was run)
         #[cfg(unix)]
-        std::os::unix::fs::symlink(
-            homebrew_keg.join("bin/nvim"),
-            prefix.join("bin/nvim"),
-        )
-        .unwrap();
+        std::os::unix::fs::symlink(homebrew_keg.join("bin/nvim"), prefix.join("bin/nvim")).unwrap();
 
         // Now zerobrew tries to link a different package with same executable
         let zerobrew_keg = tmp.path().join("cellar/my-neovim-fork/1.0.0");
@@ -466,11 +462,7 @@ mod tests {
 
         // Homebrew's existing symlink
         #[cfg(unix)]
-        std::os::unix::fs::symlink(
-            homebrew_keg.join("bin/nvim"),
-            prefix.join("bin/nvim"),
-        )
-        .unwrap();
+        std::os::unix::fs::symlink(homebrew_keg.join("bin/nvim"), prefix.join("bin/nvim")).unwrap();
 
         // zerobrew tries to link a different version: neovim 0.11.5_1
         let zerobrew_keg = tmp.path().join("cellar/neovim/0.11.5_1");
@@ -505,11 +497,7 @@ mod tests {
 
         // Homebrew's symlink
         #[cfg(unix)]
-        std::os::unix::fs::symlink(
-            homebrew_keg.join("bin/nvim"),
-            prefix.join("bin/nvim"),
-        )
-        .unwrap();
+        std::os::unix::fs::symlink(homebrew_keg.join("bin/nvim"), prefix.join("bin/nvim")).unwrap();
 
         // zerobrew's different package that also has nvim
         let zerobrew_keg = tmp.path().join("cellar/my-neovim/1.0.0");
@@ -573,17 +561,17 @@ mod tests {
         fs::create_dir_all(prefix.join("bin")).unwrap();
 
         #[cfg(unix)]
-        std::os::unix::fs::symlink(
-            homebrew_keg.join("bin/bar"),
-            prefix.join("bin/bar"),
-        )
-        .unwrap();
+        std::os::unix::fs::symlink(homebrew_keg.join("bin/bar"), prefix.join("bin/bar")).unwrap();
 
         // zerobrew keg has both `foo` and `bar` executables
         let zerobrew_keg = tmp.path().join("cellar/multi/1.0.0");
         fs::create_dir_all(zerobrew_keg.join("bin")).unwrap();
         fs::write(zerobrew_keg.join("bin/foo"), b"#!/bin/sh\necho foo").unwrap();
-        fs::write(zerobrew_keg.join("bin/bar"), b"#!/bin/sh\necho bar-conflict").unwrap();
+        fs::write(
+            zerobrew_keg.join("bin/bar"),
+            b"#!/bin/sh\necho bar-conflict",
+        )
+        .unwrap();
 
         let linker = Linker::new(&prefix).unwrap();
         let result = linker.link_keg(&zerobrew_keg);
@@ -617,11 +605,7 @@ mod tests {
         std::os::unix::fs::symlink(&relative_target, prefix.join("bin/nvim")).unwrap();
 
         // Move cellar to be relative to prefix so the symlink resolves
-        fs::rename(
-            tmp.path().join("cellar"),
-            prefix.join("cellar"),
-        )
-        .unwrap();
+        fs::rename(tmp.path().join("cellar"), prefix.join("cellar")).unwrap();
 
         // zerobrew tries to link different package
         let zerobrew_keg = tmp.path().join("zb_cellar/my-neovim/1.0.0");
