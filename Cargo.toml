@@ -1,3 +1,3 @@
 [workspace]
-members = ["zb_core", "zb_io", "zb_cli", "zb_bench"]
+members = ["zb_core", "zb_io", "zb_cli"]
 resolver = "2"

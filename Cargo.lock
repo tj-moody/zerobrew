@@ -2252,23 +2252,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "zb_bench"
-version = "0.1.0"
-dependencies = [
- "clap",
- "flate2",
- "serde",
- "serde_json",
- "sha2",
- "tar",
- "tempfile",
- "tokio",
- "wiremock",
- "zb_core",
- "zb_io",
-]
-
-[[package]]
 name = "zb_cli"
 version = "0.1.0"
 dependencies = [
