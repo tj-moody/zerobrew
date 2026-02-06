@@ -159,8 +159,12 @@ fn patch_macho_binary_strings(path: &Path, new_prefix: &str) -> Result<(), Error
                     contents[i..i + new_bytes.len()].copy_from_slice(new_bytes);
 
                     if new_bytes.len() < old_bytes.len() {
-                        for j in i + new_bytes.len()..i + old_bytes.len() {
-                            contents[j] = 0;
+                        for item in contents
+                            .iter_mut()
+                            .take(i + old_bytes.len())
+                            .skip(i + new_bytes.len())
+                        {
+                            *item = 0;
                         }
                     }
 
