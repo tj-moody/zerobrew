@@ -146,9 +146,6 @@ impl Formula {
     }
 
     pub fn is_keg_only(&self) -> bool {
-        if self.name.contains('@') {
-            return true;
-        }
         if matches!(self.keg_only, KegOnly::No) {
             return false;
         }
