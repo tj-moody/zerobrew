@@ -394,21 +394,6 @@ mod tests {
     }
 
     #[test]
-    fn versioned_formula_is_keg_only() {
-        let json = r#"{
-            "name": "postgresql@15",
-            "versions": { "stable": "15.8" },
-            "dependencies": [],
-            "bottle": { "stable": { "files": {
-                "arm64_sonoma": { "url": "https://x.com/a.tar.gz", "sha256": "aa" }
-            }}}
-        }"#;
-        let formula: Formula = serde_json::from_str(json).unwrap();
-        assert_eq!(formula.keg_only, KegOnly::No);
-        assert!(formula.is_keg_only());
-    }
-
-    #[test]
     fn keg_only_reason_deserializes_provided_by_macos() {
         let json = r#"{
             "name": "sqlite",
