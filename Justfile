@@ -1,6 +1,7 @@
 set export
 set dotenv-load
 set unstable
+set lists
 set script-interpreter := ['bash', '-euo', 'pipefail']
 
 ZEROBREW_ROOT := if env('ZEROBREW_ROOT', '') != '' {
