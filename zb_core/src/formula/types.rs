@@ -146,9 +146,6 @@ impl Formula {
     }
 
     pub fn is_keg_only(&self) -> bool {
-        if self.name.contains('@') {
-            return true;
-        }
         if matches!(self.keg_only, KegOnly::No) {
             return false;
         }
@@ -393,21 +390,6 @@ mod tests {
         assert!(
             matches!(formula.keg_only, KegOnly::Reason(ref s) if s == "it conflicts with PostgreSQL")
         );
-        assert!(formula.is_keg_only());
-    }
-
-    #[test]
-    fn versioned_formula_is_keg_only() {
-        let json = r#"{
-            "name": "postgresql@15",
-            "versions": { "stable": "15.8" },
-            "dependencies": [],
-            "bottle": { "stable": { "files": {
-                "arm64_sonoma": { "url": "https://x.com/a.tar.gz", "sha256": "aa" }
-            }}}
-        }"#;
-        let formula: Formula = serde_json::from_str(json).unwrap();
-        assert_eq!(formula.keg_only, KegOnly::No);
         assert!(formula.is_keg_only());
     }
 
